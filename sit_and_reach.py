@@ -1,103 +1,128 @@
 import cv2
 import mediapipe as mp
 import numpy as np
-import csv
+import math
+import time
 import requests
 
-OUTPUT_CSV = "broad_jump_results.csv"
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
+FPS = 30  # set to your camera FPS
+PIXELS_PER_CM = 44.0  # calibration factor
 
 mp_drawing = mp.solutions.drawing_utils
 mp_pose = mp.solutions.pose
 
-PIXELS_PER_CM = 44.0  # Set from calibration
+def calculate_metrics(release, land, pixels_per_cm, fps):
+    # Flight time (s)
+    flight_time = (land['frame'] - release['frame']) / fps
+
+    # Range in cm
+    D_cm = abs(land['x'] - release['x']) / pixels_per_cm
+
+    # Speeds (cm/s) using frame-based Δt
+    dt = flight_time if flight_time > 0 else 1e-6
+    vx = (land['x'] - release['x']) / pixels_per_cm / dt
+    vy = (land['y'] - release['y']) / pixels_per_cm / dt
+    v = math.sqrt(vx**2 + vy**2)
+
+    # Release angle (deg)
+    theta = math.degrees(math.atan2(vy, vx))
+
+    # Score (rounding rule)
+    if D_cm < 100:   # less than 1 m
+        score = round(D_cm / 10) * 10
+    else:            # 1 m or more
+        score = round(D_cm / 50) * 50
+
+    return {
+        "flight_time": flight_time,
+        "range_cm": D_cm,
+        "vx": vx,
+        "vy": vy,
+        "v": v,
+        "angle_deg": theta,
+        "score": score
+    }
 
 def main():
     cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("ERROR: Camera could not be opened.")
-        return
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
-    WINDOW_NAME = "Broad Jump Counter (press 'q' to quit, 'r' to reset, 's' to set take-off)"
+    WINDOW_NAME = "Medicine Ball Throw (press 'q' to quit, 'r' to reset)"
     cv2.namedWindow(WINDOW_NAME)
 
-    csvfile = open(OUTPUT_CSV, "w", newline="")
-    csvw = csv.writer(csvfile)
-    csvw.writerow(["timestamp", "jump_distance_cm"])
-
-    takeoff_x = None
-    landing_x = None
-    jump_distance_cm = 0.0
-    jump_count = 0
-    in_air = False
+    release = None
+    land = None
+    throw_detected = False
+    frame_count = 0
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("Camera read failed. Exiting.")
                 break
-
-            h, w = frame.shape[:2]
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(frame_rgb)
             vis_frame = frame.copy()
+            h, w = frame.shape[:2]
 
             if results.pose_landmarks:
-                mp_drawing.draw_landmarks(vis_frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
                 lm = results.pose_landmarks.landmark
+                wrist = lm[mp_pose.PoseLandmark.RIGHT_WRIST.value]
+                wrist_x = wrist.x * w
+                wrist_y = wrist.y * h
 
-                # Use left and right ankles for measurement
-                left_ankle = lm[mp_pose.PoseLandmark.LEFT_ANKLE.value]
-                right_ankle = lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value]
-                ankles_x = [left_ankle.x * w, right_ankle.x * w]
+                # Release detection
+                if not throw_detected and wrist_x > w * 0.7:
+                    release = {
+                        "frame": frame_count,
+                        "x": wrist_x,
+                        "y": wrist_y,
+                    }
+                    throw_detected = True
+                    print("Release detected!")
 
-                # 1. Set take-off line (when standing still, press 's')
-                if takeoff_x is None:
-                    cv2.putText(vis_frame, "Stand at take-off line and press 's'", (30,100),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2, cv2.LINE_AA)
-                else:
-                    # 2. Detect landing (ankles move forward, then stop)
-                    if not in_air and min(ankles_x) > takeoff_x + 30:
-                        in_air = True
-                        landing_x = min(ankles_x)
-                    elif in_air and min(ankles_x) <= landing_x:
-                        # Landed and stopped moving forward
-                        jump_distance_px = landing_x - takeoff_x
-                        jump_distance_cm = jump_distance_px / PIXELS_PER_CM
-                        jump_count += 1
-                        print(f"Jump {jump_count}: {jump_distance_cm:.2f} cm")
-                        try:
-                            requests.post("http://127.0.0.1:5000/increment", json={"jump_height": jump_distance_cm})
-                        except Exception as e:
-                            print("Could not update counter:", e)
-                        in_air = False
-                        takeoff_x = None  # Reset for next jump
+                # Landing detection
+                if throw_detected and wrist_x < w * 0.3:
+                    land = {
+                        "frame": frame_count,
+                        "x": wrist_x,
+                        "y": wrist_y,
+                    }
+                    print("Landing detected!")
 
-            # Show info
-            cv2.putText(vis_frame, f"Jumps: {jump_count}", (30,60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,255,0), 2, cv2.LINE_AA)
-            cv2.putText(vis_frame, f"Last Jump Distance: {jump_distance_cm:.2f} cm", (30,120),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 2, cv2.LINE_AA)
+            # Calculate metrics once per throw
+            if release and land:
+                metrics = calculate_metrics(release, land, PIXELS_PER_CM, FPS)
+
+                # Send to Flask API
+                try:
+                    requests.post("http://127.0.0.1:5000/increment", json=metrics)
+                except:
+                    print("⚠️ Could not connect to Flask server.")
+
+                # Display on screen
+                y0 = 60
+                for k, v in metrics.items():
+                    cv2.putText(vis_frame, f"{k}: {v:.2f}", (30, y0),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                    y0 += 40
+
+                # Reset after one throw
+                release, land = None, None
+                throw_detected = False
+
             cv2.imshow(WINDOW_NAME, vis_frame)
-
             key = cv2.waitKey(5)
             if key == ord('q'):
                 break
-            elif key == ord('s'):
-                # Set take-off line
-                if results.pose_landmarks:
-                    left_ankle = lm[mp_pose.PoseLandmark.LEFT_ANKLE.value]
-                    right_ankle = lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value]
-                    takeoff_x = min(left_ankle.x * w, right_ankle.x * w)
-                    print(f"Take-off line set at x={takeoff_x:.2f} px")
             elif key == ord('r'):
-                jump_count = 0
-                jump_distance_cm = 0.0
-                takeoff_x = None
+                release, land = None, None
+                throw_detected = False
+
+            frame_count += 1
 
     cap.release()
     cv2.destroyAllWindows()
