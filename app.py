@@ -2,25 +2,28 @@ from flask import Flask, render_template_string, request, jsonify
 
 app = Flask(__name__)
 
-counter = 0
+jump_count = 0
+last_jump_height = 0.0
 
 HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Sit-up Counter</title>
+    <title>Vertical Jump Counter</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
     <div class="container">
-        <h1>Sit-up Counter</h1>
-        <p id="count">Successful Sit-ups: <span>{{ counter }}</span></p>
+        <h1>Vertical Jump Counter</h1>
+        <p id="count">Jump Count: <span>{{ jump_count }}</span></p>
+        <p id="height">Last Jump Height: <span>{{ '{:.2f}'.format(last_jump_height) }}</span> cm</p>
     </div>
     <script>
         setInterval(function() {
             fetch('/status').then(r => r.json()).then(data => {
-                document.querySelector("#count span").textContent = data.counter;
+                document.querySelector("#count span").textContent = data.jump_count;
+                document.querySelector("#height span").textContent = Number(data.last_jump_height).toFixed(2);
             });
         }, 1000);
     </script>
@@ -30,16 +33,19 @@ HTML = """
 
 @app.route('/')
 def index():
-    return render_template_string(HTML, counter=counter)
+    return render_template_string(HTML, jump_count=jump_count, last_jump_height=last_jump_height)
 
 @app.route('/status')
 def status():
-    return jsonify(counter=counter)
+    return jsonify(jump_count=jump_count, last_jump_height=last_jump_height)
 
 @app.route('/increment', methods=['POST'])
 def increment():
-    global counter
-    counter += 1
+    global jump_count, last_jump_height
+    data = request.get_json()
+    jump_count += 1
+    if data and "jump_height" in data:
+        last_jump_height = data["jump_height"]
     return jsonify(success=True)
 
 if __name__ == '__main__':
