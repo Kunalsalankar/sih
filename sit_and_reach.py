@@ -4,12 +4,14 @@ import numpy as np
 import csv
 import requests
 
-OUTPUT_CSV = "jump_results.csv"
+OUTPUT_CSV = "broad_jump_results.csv"
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 
 mp_drawing = mp.solutions.drawing_utils
 mp_pose = mp.solutions.pose
+
+PIXELS_PER_CM = 44.0  # Set from calibration
 
 def main():
     cap = cv2.VideoCapture(0)
@@ -19,19 +21,16 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
-    WINDOW_NAME = "Vertical Jump Counter (press 'q' to quit, 'r' to reset)"
+    WINDOW_NAME = "Broad Jump Counter (press 'q' to quit, 'r' to reset, 's' to set take-off)"
     cv2.namedWindow(WINDOW_NAME)
 
     csvfile = open(OUTPUT_CSV, "w", newline="")
     csvw = csv.writer(csvfile)
-    csvw.writerow(["timestamp", "jump_height_cm"])
+    csvw.writerow(["timestamp", "jump_distance_cm"])
 
-    # Calibration: pixels_per_cm (set this after calibration, e.g. using wall marks)
-    pixels_per_cm = 44.0  # <-- Set this from your calibration step
-
-    standing_reach_y = None
-    peak_jump_y = None
-    jump_height_cm = 0.0
+    takeoff_x = None
+    landing_x = None
+    jump_distance_cm = 0.0
     jump_count = 0
     in_air = False
 
@@ -51,40 +50,37 @@ def main():
                 mp_drawing.draw_landmarks(vis_frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
                 lm = results.pose_landmarks.landmark
 
-                # Use right wrist for fingertip height (can use left or average)
-                wrist = lm[mp_pose.PoseLandmark.RIGHT_WRIST.value]
-                wrist_y_px = wrist.y * h
+                # Use left and right ankles for measurement
+                left_ankle = lm[mp_pose.PoseLandmark.LEFT_ANKLE.value]
+                right_ankle = lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value]
+                ankles_x = [left_ankle.x * w, right_ankle.x * w]
 
-                # 1. Set standing reach (when user is standing still)
-                if standing_reach_y is None:
-                    cv2.putText(vis_frame, "Stand still and press 's' to set reach", (30,100),
+                # 1. Set take-off line (when standing still, press 's')
+                if takeoff_x is None:
+                    cv2.putText(vis_frame, "Stand at take-off line and press 's'", (30,100),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2, cv2.LINE_AA)
-
-                # 2. Detect jump (wrist rises above threshold)
-                if standing_reach_y is not None:
-                    if wrist_y_px < standing_reach_y - 30:  # Jump detected (hand goes up)
-                        if not in_air:
-                            in_air = True
-                            peak_jump_y = wrist_y_px
-                        else:
-                            peak_jump_y = min(peak_jump_y, wrist_y_px)
-                    else:
-                        if in_air:
-                            # Jump finished, calculate height
-                            jump_height_px = standing_reach_y - peak_jump_y
-                            jump_height_cm = jump_height_px / pixels_per_cm
-                            jump_count += 1
-                            print(f"Jump {jump_count}: {jump_height_cm:.2f} cm")
-                            try:
-                                requests.post("http://127.0.0.1:5000/increment", json={"jump_height": jump_height_cm})
-                            except Exception as e:
-                                print("Could not update counter:", e)
-                            in_air = False
+                else:
+                    # 2. Detect landing (ankles move forward, then stop)
+                    if not in_air and min(ankles_x) > takeoff_x + 30:
+                        in_air = True
+                        landing_x = min(ankles_x)
+                    elif in_air and min(ankles_x) <= landing_x:
+                        # Landed and stopped moving forward
+                        jump_distance_px = landing_x - takeoff_x
+                        jump_distance_cm = jump_distance_px / PIXELS_PER_CM
+                        jump_count += 1
+                        print(f"Jump {jump_count}: {jump_distance_cm:.2f} cm")
+                        try:
+                            requests.post("http://127.0.0.1:5000/increment", json={"jump_height": jump_distance_cm})
+                        except Exception as e:
+                            print("Could not update counter:", e)
+                        in_air = False
+                        takeoff_x = None  # Reset for next jump
 
             # Show info
             cv2.putText(vis_frame, f"Jumps: {jump_count}", (30,60),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,255,0), 2, cv2.LINE_AA)
-            cv2.putText(vis_frame, f"Last Jump Height: {jump_height_cm:.2f} cm", (30,120),
+            cv2.putText(vis_frame, f"Last Jump Distance: {jump_distance_cm:.2f} cm", (30,120),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 2, cv2.LINE_AA)
             cv2.imshow(WINDOW_NAME, vis_frame)
 
@@ -92,14 +88,16 @@ def main():
             if key == ord('q'):
                 break
             elif key == ord('s'):
-                # Set standing reach
+                # Set take-off line
                 if results.pose_landmarks:
-                    wrist = lm[mp_pose.PoseLandmark.RIGHT_WRIST.value]
-                    standing_reach_y = wrist.y * h
-                    print(f"Standing reach set at y={standing_reach_y:.2f} px")
+                    left_ankle = lm[mp_pose.PoseLandmark.LEFT_ANKLE.value]
+                    right_ankle = lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value]
+                    takeoff_x = min(left_ankle.x * w, right_ankle.x * w)
+                    print(f"Take-off line set at x={takeoff_x:.2f} px")
             elif key == ord('r'):
                 jump_count = 0
-                jump_height_cm = 0.0
+                jump_distance_cm = 0.0
+                takeoff_x = None
 
     cap.release()
     cv2.destroyAllWindows()
